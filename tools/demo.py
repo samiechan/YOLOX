@@ -30,6 +30,9 @@ def make_parser():
     parser.add_argument(
         "--path", default="./assets/dog.jpg", help="path to images or video"
     )
+    parser.add_argument(
+        "--save_path", default=None, help="path to save results"
+    )
     parser.add_argument("--camid", type=int, default=0, help="webcam demo camera id")
     parser.add_argument(
         "--save_result",
@@ -83,6 +86,7 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
+    parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
     return parser
 
 
@@ -108,6 +112,7 @@ class Predictor(object):
         device="cpu",
         fp16=False,
         legacy=False,
+        save_crop=False,  # save cropped prediction boxes
     ):
         self.model = model
         self.cls_names = cls_names
@@ -119,6 +124,7 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        self.save_crop = save_crop
         if trt_file is not None:
             from torch2trt import TRTModule
 
@@ -165,6 +171,45 @@ class Predictor(object):
             logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
 
+    def crop(self, output, img_info, cls_conf=0.35):
+        ratio = img_info["ratio"]
+        img = img_info["raw_img"]
+        if output is None:
+            return img
+        output = output.cpu()
+
+        bboxes = output[:, 0:4]
+
+        # preprocessing: resize
+        bboxes /= ratio
+        
+        cls = output[:, 6]
+        scores = output[:, 4] * output[:, 5]        
+
+        imgs = []
+
+        for i in range(len(bboxes)):
+            box = bboxes[i]            
+            score = scores[i]
+            cls_id = int(cls[i])
+
+            # TODO: Add arguments for classes
+            if self.cls_names[cls_id] != "car":
+                continue
+
+            if score < cls_conf:
+                continue
+            x0 = int(box[0])
+            y0 = int(box[1])
+            x1 = int(box[2])
+            y1 = int(box[3])
+
+            crop = img[y0:y1, x0:x1].copy()
+
+            if crop.any():
+                imgs.append(img[y0:y1, x0:x1].copy())
+        return imgs
+
     def visual(self, output, img_info, cls_conf=0.35):
         ratio = img_info["ratio"]
         img = img_info["raw_img"]
@@ -184,7 +229,7 @@ class Predictor(object):
         return vis_res
 
 
-def image_demo(predictor, vis_folder, path, current_time, save_result):
+def image_demo(predictor, vis_folder, path, current_time, save_result, save_crop, save_path):
     if os.path.isdir(path):
         files = get_image_list(path)
     else:
@@ -192,18 +237,36 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
     files.sort()
     for image_name in files:
         outputs, img_info = predictor.inference(image_name)
-        result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
-        if save_result:
-            save_folder = os.path.join(
-                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            )
-            os.makedirs(save_folder, exist_ok=True)
-            save_file_name = os.path.join(save_folder, os.path.basename(image_name))
-            logger.info("Saving detection result in {}".format(save_file_name))
-            cv2.imwrite(save_file_name, result_image)
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
-            break
+        if save_crop:
+            result_images = predictor.crop(outputs[0], img_info, predictor.confthre)
+
+            save_path = save_path if save_path is not None else vis_folder
+
+            if save_result:
+                save_folder = os.path.join(
+                    save_path, "crops"
+                )
+                os.makedirs(save_folder, exist_ok=True)
+
+                print(f"Save folder: {save_folder}")
+
+                for idx, img in enumerate(result_images):
+                    save_file_name = os.path.join(save_folder, f"{os.path.splitext(os.path.basename(image_name))[0]}_{idx}.jpg")
+                    logger.info("Saving detection result in {}".format(save_file_name))
+                    cv2.imwrite(save_file_name, img)
+        else:
+            result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
+            if save_result:
+                save_folder = os.path.join(
+                    vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+                )
+                os.makedirs(save_folder, exist_ok=True)
+                save_file_name = os.path.join(save_folder, os.path.basename(image_name))
+                logger.info("Saving detection result in {}".format(save_file_name))
+                cv2.imwrite(save_file_name, result_image)
+            #ch = cv2.waitKey(0)
+            #if ch == 27 or ch == ord("q") or ch == ord("Q"):
+                #break
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -308,7 +371,7 @@ def main(exp, args):
     )
     current_time = time.localtime()
     if args.demo == "image":
-        image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
+        image_demo(predictor, vis_folder, args.path, current_time, args.save_result, args.save_crop, args.save_path)
     elif args.demo == "video" or args.demo == "webcam":
         imageflow_demo(predictor, vis_folder, current_time, args)
 
